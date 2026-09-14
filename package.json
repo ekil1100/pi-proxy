@@ -1,7 +1,7 @@
 {
   "name": "pi-model-proxy",
-  "version": "1.0.1",
-  "description": "Per-model HTTP forward proxy routing for Pi",
+  "version": "2.0.0",
+  "description": "Per-provider HTTP forward proxy routing for Pi",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ekil1100/pi-proxy.git"
@@ -21,6 +21,9 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "scripts": {
+    "test": "node --test"
   },
   "dependencies": {
     "undici": "^8.3.0"

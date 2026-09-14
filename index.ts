@@ -1,9 +1,8 @@
 /**
- * Model Proxy Extension
+ * Provider Proxy Extension
  *
- * Per-model HTTP proxy configuration. When switching to a model that has a
- * proxy configured, all HTTP requests (API calls) are routed through that
- * proxy via HTTP CONNECT tunneling. Switching to any other model restores
+ * Per-provider HTTP proxy configuration. Models from the same provider share
+ * one proxy. Switching to a provider without a configured proxy restores
  * direct connection.
  *
  * Uses undici's ProxyAgent + setGlobalDispatcher under the hood, which
@@ -14,9 +13,9 @@
  * Example:
  * ```json
  * {
- *   "models": {
- *     "openai-codex/gpt-5.5": "http://127.0.0.1:7890",
- *     "anthropic/claude-sonnet-4-5": "http://127.0.0.1:7890"
+ *   "providers": {
+ *     "openai-codex": "http://127.0.0.1:7890",
+ *     "anthropic": "http://127.0.0.1:7890"
  *   }
  * }
  * ```
@@ -27,10 +26,10 @@
  * Usage:
  * - Auto-applies on model switch (via /model or Ctrl+P)
  * - `/proxy` — show status
- * - `/proxy set openai-codex/gpt-5.5 http://127.0.0.1:7890`
- * - `/proxy remove openai-codex/gpt-5.5`
+ * - `/proxy set openai-codex http://127.0.0.1:7890`
+ * - `/proxy remove openai-codex`
  * - `/proxy list` — list all configured proxies
- * - Status bar indicator when proxy is active: "🔀 proxy:openai-codex"
+ * - Status bar indicator when proxy is active: "proxy"
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -47,8 +46,8 @@ import type { Dispatcher } from "undici";
 // ── Types ───────────────────────────────────────────────────────────────────
 
 interface ProxyConfig {
-  /** Map of "provider/modelId" → proxy URL (e.g. "http://127.0.0.1:7890") */
-  models: Record<string, string>;
+  /** Map of provider ID → proxy URL (e.g. "http://127.0.0.1:7890"). */
+  providers: Record<string, string>;
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -62,7 +61,7 @@ let activeProxyProvider: string | null = null;
 /** Currently active proxy URL. */
 let activeProxyUrl: string | null = null;
 /** Loaded proxy configuration. */
-let proxyConfig: ProxyConfig = { models: {} };
+let proxyConfig: ProxyConfig = { providers: {} };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -70,20 +69,28 @@ function configPath(): string {
   return join(getAgentDir(), "model-proxy.json");
 }
 
+function isProviderId(provider: string): boolean {
+  return provider.length > 0 && !/[\s/]/.test(provider);
+}
+
 function loadConfig(): void {
+  proxyConfig = { providers: {} };
   const path = configPath();
-  if (existsSync(path)) {
-    try {
-      proxyConfig = JSON.parse(readFileSync(path, "utf-8"));
-      if (!proxyConfig.models || typeof proxyConfig.models !== "object") {
-        proxyConfig = { models: {} };
-      }
-    } catch (err) {
-      console.error(`[model-proxy] Failed to load config: ${err}`);
-      proxyConfig = { models: {} };
+  if (!existsSync(path)) return;
+
+  try {
+    const config = JSON.parse(readFileSync(path, "utf-8"));
+    if (!config?.providers || typeof config.providers !== "object" || Array.isArray(config.providers)) {
+      throw new Error('Expected a "providers" object. Configure provider keys manually.');
     }
-  } else {
-    proxyConfig = { models: {} };
+    for (const [provider, url] of Object.entries(config.providers)) {
+      if (!isProviderId(provider) || typeof url !== "string" || url.length === 0) {
+        throw new Error("Expected provider IDs mapped to proxy URL strings.");
+      }
+    }
+    proxyConfig = { providers: config.providers };
+  } catch (err) {
+    console.error(`[model-proxy] Failed to load config: ${err}`);
   }
 }
 
@@ -97,12 +104,10 @@ function saveConfig(): void {
   }
 }
 
-function getProxyUrl(provider: string, modelId: string): string | undefined {
-  return proxyConfig.models[`${provider}/${modelId}`];
-}
-
-function modelKey(provider: string, modelId: string): string {
-  return `${provider}/${modelId}`;
+function getProxyUrl(provider: string): string | undefined {
+  return Object.hasOwn(proxyConfig.providers, provider)
+    ? proxyConfig.providers[provider]
+    : undefined;
 }
 
 // ── Proxy Management ────────────────────────────────────────────────────────
@@ -111,7 +116,7 @@ function modelKey(provider: string, modelId: string): string {
  * Route all HTTP traffic through the proxy. Uses undici's ProxyAgent which
  * tunnels HTTPS via HTTP CONNECT and forwards HTTP directly.
  */
-function applyProxy(pi: ExtensionAPI, provider: string, proxyUrl: string): boolean {
+function applyProxy(provider: string, proxyUrl: string): boolean {
   if (activeProxyProvider === provider && activeProxyUrl === proxyUrl) {
     return false; // Already applied
   }
@@ -140,7 +145,7 @@ function applyProxy(pi: ExtensionAPI, provider: string, proxyUrl: string): boole
 /**
  * Restore direct connection (no proxy).
  */
-function removeProxy(_pi: ExtensionAPI): boolean {
+function removeProxy(): boolean {
   if (!activeProxyAgent) return false;
 
   // Restore the original dispatcher
@@ -157,26 +162,20 @@ function removeProxy(_pi: ExtensionAPI): boolean {
 }
 
 /**
- * Handle model selection: apply or remove proxy based on config.
+ * Apply the selected provider's proxy, reusing it across model changes.
  */
-function handleModelChange(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  provider: string,
-  modelId: string,
-): void {
-  const proxyUrl = getProxyUrl(provider, modelId);
+function handleProviderChange(ctx: ExtensionContext, provider: string): void {
+  const proxyUrl = getProxyUrl(provider);
 
   if (proxyUrl) {
-    // This model needs a proxy
     if (activeProxyProvider === provider) {
       if (activeProxyUrl !== proxyUrl) {
-        applyProxy(pi, provider, proxyUrl);
+        applyProxy(provider, proxyUrl);
         ctx.ui.notify(`Proxy updated: ${provider} → ${proxyUrl}`, "info");
       }
     } else {
-      removeProxy(pi);
-      applyProxy(pi, provider, proxyUrl);
+      removeProxy();
+      applyProxy(provider, proxyUrl);
       ctx.ui.notify(`Proxy ON: ${provider} → ${proxyUrl}`, "info");
     }
     updateStatus(ctx);
@@ -184,7 +183,7 @@ function handleModelChange(
     // No proxy needed — restore direct connection
     if (activeProxyAgent) {
       const was = activeProxyProvider;
-      removeProxy(pi);
+      removeProxy();
       ctx.ui.notify(`Proxy OFF (${was} restored to direct)`, "info");
       updateStatus(ctx);
     }
@@ -195,7 +194,7 @@ function handleModelChange(
 
 function updateStatus(ctx: ExtensionContext): void {
   if (activeProxyProvider && activeProxyUrl) {
-    ctx.ui.setStatus("proxy", ctx.ui.theme.fg("warning", `🔀 proxy:${activeProxyProvider}`));
+    ctx.ui.setStatus("proxy", ctx.ui.theme.fg("warning", "proxy"));
   } else {
     ctx.ui.setStatus("proxy", undefined);
   }
@@ -205,7 +204,7 @@ function updateStatus(ctx: ExtensionContext): void {
 
 function registerCommands(pi: ExtensionAPI): void {
   pi.registerCommand("proxy", {
-    description: "Configure per-model HTTP proxy settings",
+    description: "Configure per-provider HTTP proxy settings",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/);
 
@@ -223,12 +222,12 @@ function registerCommands(pi: ExtensionAPI): void {
 
         case "set": {
           if (parts.length < 3) {
-            ctx.ui.notify("Usage: /proxy set <provider/modelId> <proxyUrl>", "error");
+            ctx.ui.notify("Usage: /proxy set <provider> <proxyUrl>", "error");
             return;
           }
-          const key = parts[1];
+          const provider = parts[1];
           const url = parts[2];
-          setProxy(pi, ctx, key, url);
+          setProxy(ctx, provider, url);
           return;
         }
 
@@ -236,10 +235,10 @@ function registerCommands(pi: ExtensionAPI): void {
         case "rm":
         case "delete": {
           if (parts.length < 2) {
-            ctx.ui.notify("Usage: /proxy remove <provider/modelId>", "error");
+            ctx.ui.notify("Usage: /proxy remove <provider>", "error");
             return;
           }
-          removeProxyConfig(pi, ctx, parts[1]);
+          removeProxyConfig(ctx, parts[1]);
           return;
         }
 
@@ -254,32 +253,27 @@ function registerCommands(pi: ExtensionAPI): void {
 }
 
 function showStatus(ctx: ExtensionContext): void {
-  const currentModel = ctx.model;
-  const currentKey = currentModel
-    ? modelKey(currentModel.provider, currentModel.id)
-    : "none";
-  const currentProxy = currentModel
-    ? getProxyUrl(currentModel.provider, currentModel.id)
-    : undefined;
+  const currentProvider = ctx.model?.provider;
+  const currentProxy = currentProvider ? getProxyUrl(currentProvider) : undefined;
 
   const lines: string[] = [
-    `Current model: ${currentKey}`,
+    `Current provider: ${currentProvider ?? "none"}`,
     currentProxy
       ? `Configured proxy: ${currentProxy}`
-      : "No proxy configured for this model",
+      : "No proxy configured for this provider",
     activeProxyAgent
       ? `Traffic routing: PROXY ${activeProxyProvider} → ${activeProxyUrl}`
       : "Traffic routing: DIRECT (no proxy active)",
     "",
     `Config file: ${configPath()}`,
-    `Entries: ${Object.keys(proxyConfig.models).length}`,
+    `Providers: ${Object.keys(proxyConfig.providers).length}`,
   ];
 
   ctx.ui.notify(lines.join("\n"), "info");
 }
 
 function showProxyList(ctx: ExtensionContext): void {
-  const entries = Object.entries(proxyConfig.models);
+  const entries = Object.entries(proxyConfig.providers);
 
   if (entries.length === 0) {
     ctx.ui.notify("No proxy entries configured.", "info");
@@ -291,24 +285,16 @@ function showProxyList(ctx: ExtensionContext): void {
     ([key, url]) => `${key.padEnd(maxLen + 2)} → ${url}`,
   );
 
-  ctx.ui.notify(`Model proxy config:\n${lines.join("\n")}`, "info");
+  ctx.ui.notify(`Provider proxy config:\n${lines.join("\n")}`, "info");
 }
 
-function setProxy(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  key: string,
-  url: string,
-): void {
-  if (!key.includes("/")) {
-    ctx.ui.notify(
-      `Invalid model key "${key}". Expected: provider/modelId`,
-      "error",
-    );
+function setProxy(ctx: ExtensionContext, provider: string, url: string): void {
+  if (!isProviderId(provider)) {
+    ctx.ui.notify(`Invalid provider "${provider}". Expected: provider ID without a model suffix.`, "error");
     return;
   }
 
-  // Validate URL (accept http, https, socks5, etc.)
+  // Validate the URL before persisting it.
   try {
     new URL(url);
   } catch {
@@ -316,39 +302,39 @@ function setProxy(
     return;
   }
 
-  const [provider, modelId] = key.split("/", 2);
   loadConfig();
-  proxyConfig.models[key] = url;
+  proxyConfig.providers = { ...proxyConfig.providers, [provider]: url };
   saveConfig();
 
-  ctx.ui.notify(`Proxy set: ${key} → ${url}`, "info");
+  ctx.ui.notify(`Proxy set: ${provider} → ${url}`, "info");
 
-  // If currently on this model, apply immediately
-  if (ctx.model && modelKey(ctx.model.provider, ctx.model.id) === key) {
-    handleModelChange(pi, ctx, provider, modelId);
+  // Apply immediately to any active model from this provider.
+  if (ctx.model?.provider === provider) {
+    handleProviderChange(ctx, provider);
   }
 }
 
-function removeProxyConfig(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  key: string,
-): void {
-  loadConfig();
-
-  if (!(key in proxyConfig.models)) {
-    ctx.ui.notify(`No proxy configured for: ${key}`, "warning");
+function removeProxyConfig(ctx: ExtensionContext, provider: string): void {
+  if (!isProviderId(provider)) {
+    ctx.ui.notify(`Invalid provider "${provider}". Expected: provider ID without a model suffix.`, "error");
     return;
   }
 
-  delete proxyConfig.models[key];
+  loadConfig();
+
+  if (!Object.hasOwn(proxyConfig.providers, provider)) {
+    ctx.ui.notify(`No proxy configured for: ${provider}`, "warning");
+    return;
+  }
+
+  delete proxyConfig.providers[provider];
   saveConfig();
 
-  ctx.ui.notify(`Proxy removed: ${key}`, "info");
+  ctx.ui.notify(`Proxy removed: ${provider}`, "info");
 
-  // If currently on this model, restore direct connection
-  if (ctx.model && modelKey(ctx.model.provider, ctx.model.id) === key) {
-    if (removeProxy(pi)) {
+  // Restore direct traffic for any active model from this provider.
+  if (ctx.model?.provider === provider) {
+    if (removeProxy()) {
       updateStatus(ctx);
       ctx.ui.notify("Proxy disabled, traffic now direct", "info");
     }
@@ -371,32 +357,23 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     loadConfig();
 
-    if (ctx.model) {
-      const proxyUrl = getProxyUrl(ctx.model.provider, ctx.model.id);
-      if (proxyUrl) {
-        applyProxy(pi, ctx.model.provider, proxyUrl);
-      }
+    const provider = ctx.model?.provider;
+    const proxyUrl = provider ? getProxyUrl(provider) : undefined;
+    if (provider && proxyUrl) {
+      applyProxy(provider, proxyUrl);
+    } else {
+      removeProxy();
     }
     updateStatus(ctx);
   });
 
-  // On model change, apply/remove proxy
+  // Model changes, including restores, use only the provider for routing.
   pi.on("model_select", async (event, ctx) => {
-    // Skip restore — proxy already applied in session_start
-    if (event.source === "restore") return;
-
-    handleModelChange(pi, ctx, event.model.provider, event.model.id);
+    handleProviderChange(ctx, event.model.provider);
   });
 
-  // Clean up ProxyAgent on shutdown
+  // Restore direct traffic and clear all active proxy state on shutdown.
   pi.on("session_shutdown", async () => {
-    if (activeProxyAgent) {
-      // Restore direct dispatcher so shutdown requests don't use proxy
-      if (directDispatcher) {
-        setGlobalDispatcher(directDispatcher);
-      }
-      try { activeProxyAgent.close(); } catch {}
-      activeProxyAgent = null;
-    }
+    removeProxy();
   });
 }

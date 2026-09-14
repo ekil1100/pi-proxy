@@ -1,10 +1,10 @@
 # pi-model-proxy
 
-A pi extension for per-model HTTP forward proxy routing.
+一个按 provider 配置 HTTP 正向代理的 Pi 扩展。同一 provider 下的所有模型共享代理，不需要逐个配置模型。
 
-It switches Node/undici's global dispatcher to a `ProxyAgent` when the active model matches your config, then restores direct traffic when you switch away.
+当前模型所属的 provider 配有代理时，扩展将 Node/undici 的全局 dispatcher 切换到 `ProxyAgent`；切换到未配置代理的 provider 时恢复直连。同一 provider 内切换模型会复用当前代理连接池。
 
-This is for real HTTP proxy traffic, not provider `baseUrl` endpoint rewriting.
+这里配置的是真正的 HTTP 代理，不是改写 provider 的 `baseUrl`。
 
 ## 安装
 
@@ -24,35 +24,55 @@ npm install
 
 两种方式任选其一，避免重复加载。安装后重启 Pi 或运行 `/reload`。
 
-## Configure
+## 配置
 
-Create `~/.pi/agent/model-proxy.json`:
+创建 `~/.pi/agent/model-proxy.json`：
 
 ```json
 {
-  "models": {
-    "openai-codex/gpt-5.5": "http://127.0.0.1:7897"
+  "providers": {
+    "openai-codex": "http://127.0.0.1:7897",
+    "anthropic": "http://127.0.0.1:7898"
   }
 }
 ```
 
-Keys are `provider/modelId`. Values are HTTP proxy URLs.
+键是 provider ID，例如 `openai-codex`、`anthropic` 或自定义 provider ID；值是代理 URL。键中不再包含模型名称。手动编辑配置后，重启 Pi 或运行 `/reload`。
 
-## Commands
+### 旧配置处理
+
+这是不兼容的配置格式变更：旧 `models` 字段及 `provider/modelId` 键已移除，不再读取，也不自动迁移。升级前备份旧配置，再手动改为上面的 `providers` 格式。同一 provider 原来有多个不同代理时，需要自行选择一个。
+
+包名仍为 `pi-model-proxy`，配置文件名仍为 `model-proxy.json`。读取旧文件不会修改它；执行新的 `/proxy set` 命令会按 `providers` 格式重写配置。
+
+## 命令
 
 ```text
 /proxy
 /proxy status
 /proxy list
-/proxy set openai-codex/gpt-5.5 http://127.0.0.1:7897
-/proxy remove openai-codex/gpt-5.5
+/proxy set openai-codex http://127.0.0.1:7897
+/proxy remove openai-codex
 ```
 
-## Notes
+- `set` 为整个 provider 设置代理；如果当前模型属于该 provider，立即生效。
+- `remove` 删除整个 provider 的代理；如果当前正在使用该 provider，立即恢复直连。
+- `status` 显示当前 provider、代理及实际路由状态，`list` 按 provider 列出配置。
+- 命令不再接受 `provider/modelId` 参数。
 
-- HTTPS requests are tunneled through the proxy via HTTP CONNECT.
-- The dispatcher change is process-global while the matching model is active.
-- If a proxy exit IP is blocked by Cloudflare, change the proxy node; the extension cannot solve Cloudflare challenges.
+## 限制
+
+- HTTPS 请求通过 HTTP CONNECT 隧道传输。
+- dispatcher 的变更作用于整个进程，而不是逐请求隔离；当前 provider 的代理生效时，其他使用全局 dispatcher 的请求也会经过它。
+- 如果代理出口 IP 被 Cloudflare 封禁，需要更换代理节点；扩展不能解决 Cloudflare 验证问题。
+
+## 开发验证
+
+```bash
+npm test
+```
+
+测试使用 Node.js 内置测试运行器，不新增依赖。覆盖 provider 切换、同 provider 模型复用、配置读写、旧格式拒绝及关闭时恢复直连，不连接真实模型服务。
 
 ## 发布到 npm
 
@@ -90,6 +110,6 @@ git push origin main --follow-tags
 - 推送 `v*` tag 自动触发；tag 必须与 `package.json` 的版本完全一致，例如 `v1.0.1`。
 - 正式版本发布到 `latest`，含预发布标识的版本自动发布到 `next`。
 - 也可在 Actions 页面手动运行，但只能选择 `main`，填写当前 `package.json` 版本，并选择 `latest`、`next` 或 `beta`。
-- 工作流检查版本是否已存在，安装依赖并执行 `npm pack --dry-run` 后发布。仓库目前没有测试或类型检查脚本，因此工作流没有这些步骤。
+- 工作流检查版本是否已存在，安装依赖并执行 `npm test`、`npm pack --dry-run` 后发布。仓库目前没有类型检查脚本。
 
 详见 [npm Trusted Publishing 文档](https://docs.npmjs.com/trusted-publishers/)。

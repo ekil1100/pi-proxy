@@ -1,8 +1,39 @@
 {
   "name": "pi-model-proxy",
-  "version": "1.0.0",
-  "private": true,
+  "version": "1.0.1",
+  "description": "Per-model HTTP forward proxy routing for Pi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ekil1100/pi-proxy.git"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "proxy"
+  ],
+  "files": [
+    "index.ts",
+    "model-proxy.example.json",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "dependencies": {
     "undici": "^8.3.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

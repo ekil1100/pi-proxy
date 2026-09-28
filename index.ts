@@ -25,7 +25,10 @@
  *
  * Usage:
  * - Auto-applies on model switch (via /model or Ctrl+P)
- * - `/proxy` — show status
+ * - `/proxy` — toggle proxy routing for the current session
+ * - `/proxy on|off` — enable or disable proxy routing
+ * - `/proxy default on|off` — persist the default for future sessions
+ * - `/proxy status` — show status
  * - `/proxy set openai-codex http://127.0.0.1:7890`
  * - `/proxy remove openai-codex`
  * - `/proxy list` — list all configured proxies
@@ -46,6 +49,8 @@ import type { Dispatcher } from "undici";
 // ── Types ───────────────────────────────────────────────────────────────────
 
 interface ProxyConfig {
+  /** Whether proxy routing is enabled on session startup (defaults to true). */
+  defaultEnabled?: boolean;
   /** Map of provider ID → proxy URL (e.g. "http://127.0.0.1:7890"). */
   providers: Record<string, string>;
 }
@@ -62,6 +67,8 @@ let activeProxyProvider: string | null = null;
 let activeProxyUrl: string | null = null;
 /** Loaded proxy configuration. */
 let proxyConfig: ProxyConfig = { providers: {} };
+/** Runtime switch, independent from the persisted startup default. */
+let enabled = true;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -88,19 +95,27 @@ function loadConfig(): void {
         throw new Error("Expected provider IDs mapped to proxy URL strings.");
       }
     }
-    proxyConfig = { providers: config.providers };
+    if (config.defaultEnabled !== undefined && typeof config.defaultEnabled !== "boolean") {
+      throw new Error('Expected "defaultEnabled" to be a boolean.');
+    }
+    proxyConfig = {
+      providers: config.providers,
+      ...(config.defaultEnabled !== undefined ? { defaultEnabled: config.defaultEnabled } : {}),
+    };
   } catch (err) {
     console.error(`[model-proxy] Failed to load config: ${err}`);
   }
 }
 
-function saveConfig(): void {
+function saveConfig(): boolean {
   const path = configPath();
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(proxyConfig, null, 2) + "\n", "utf-8");
+    return true;
   } catch (err) {
     console.error(`[model-proxy] Failed to save config: ${err}`);
+    return false;
   }
 }
 
@@ -165,7 +180,7 @@ function removeProxy(): boolean {
  * Apply the selected provider's proxy, reusing it across model changes.
  */
 function handleProviderChange(ctx: ExtensionContext, provider: string): void {
-  const proxyUrl = getProxyUrl(provider);
+  const proxyUrl = enabled ? getProxyUrl(provider) : undefined;
 
   if (proxyUrl) {
     if (activeProxyProvider === provider) {
@@ -205,17 +220,54 @@ function updateStatus(ctx: ExtensionContext): void {
 function registerCommands(pi: ExtensionAPI): void {
   pi.registerCommand("proxy", {
     description: "Configure per-provider HTTP proxy settings",
+    getArgumentCompletions: (prefix) => {
+      const choices = ["on", "off", "default on", "default off", "status", "list", "set", "remove"];
+      const matches = choices.filter((value) => value.startsWith(prefix));
+      return matches.length > 0
+        ? matches.map((value) => ({ value, label: value }))
+        : null;
+    },
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/);
 
-      if (parts.length === 0 || parts[0] === "" || parts[0] === "status") {
-        showStatus(ctx);
+      if (parts[0] === "") {
+        setEnabled(ctx, !enabled);
         return;
       }
 
       const subcommand = parts[0].toLowerCase();
 
       switch (subcommand) {
+        case "on":
+        case "off":
+          if (parts.length !== 1) {
+            ctx.ui.notify("Usage: /proxy on|off", "error");
+            return;
+          }
+          setEnabled(ctx, subcommand === "on");
+          return;
+
+        case "default": {
+          if (parts.length !== 2 || !["on", "off"].includes(parts[1])) {
+            ctx.ui.notify("Usage: /proxy default on|off", "error");
+            return;
+          }
+          loadConfig();
+          const previous = proxyConfig.defaultEnabled;
+          proxyConfig.defaultEnabled = parts[1] === "on";
+          if (!saveConfig()) {
+            proxyConfig.defaultEnabled = previous;
+            ctx.ui.notify("Failed to save proxy default.", "error");
+            return;
+          }
+          ctx.ui.notify(`Proxy default: ${parts[1].toUpperCase()} (applies on next session startup)`, "info");
+          return;
+        }
+
+        case "status":
+          showStatus(ctx);
+          return;
+
         case "list":
           showProxyList(ctx);
           return;
@@ -244,7 +296,7 @@ function registerCommands(pi: ExtensionAPI): void {
 
         default:
           ctx.ui.notify(
-            `Unknown subcommand: ${subcommand}. Try: status, list, set, remove`,
+            `Unknown subcommand: ${subcommand}. Try: on, off, default on|off, status, list, set, remove`,
             "error",
           );
       }
@@ -252,11 +304,24 @@ function registerCommands(pi: ExtensionAPI): void {
   });
 }
 
+function setEnabled(ctx: ExtensionContext, value: boolean): void {
+  enabled = value;
+  if (ctx.model) {
+    handleProviderChange(ctx, ctx.model.provider);
+  } else {
+    removeProxy();
+  }
+  updateStatus(ctx);
+  showStatus(ctx);
+}
+
 function showStatus(ctx: ExtensionContext): void {
   const currentProvider = ctx.model?.provider;
   const currentProxy = currentProvider ? getProxyUrl(currentProvider) : undefined;
 
   const lines: string[] = [
+    `Proxy plugin: ${enabled ? "ON" : "OFF"}`,
+    `Startup default: ${(proxyConfig.defaultEnabled ?? true) ? "ON" : "OFF"}`,
     `Current provider: ${currentProvider ?? "none"}`,
     currentProxy
       ? `Configured proxy: ${currentProxy}`
@@ -356,9 +421,10 @@ export default function (pi: ExtensionAPI) {
   // On session start, sync proxy state with current model
   pi.on("session_start", async (_event, ctx) => {
     loadConfig();
+    enabled = proxyConfig.defaultEnabled ?? true;
 
     const provider = ctx.model?.provider;
-    const proxyUrl = provider ? getProxyUrl(provider) : undefined;
+    const proxyUrl = enabled && provider ? getProxyUrl(provider) : undefined;
     if (provider && proxyUrl) {
       applyProxy(provider, proxyUrl);
     } else {

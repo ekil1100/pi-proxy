@@ -1,4 +1,5 @@
 {
+  "defaultEnabled": true,
   "providers": {
     "openai-codex": "http://127.0.0.1:7897"
   }

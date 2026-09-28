@@ -30,6 +30,7 @@ npm install
 
 ```json
 {
+  "defaultEnabled": true,
   "providers": {
     "openai-codex": "http://127.0.0.1:7897",
     "anthropic": "http://127.0.0.1:7898"
@@ -38,6 +39,8 @@ npm install
 ```
 
 键是 provider ID，例如 `openai-codex`、`anthropic` 或自定义 provider ID；值是代理 URL。键中不再包含模型名称。手动编辑配置后，重启 Pi 或运行 `/reload`。
+
+`defaultEnabled` 控制会话启动时是否启用代理，省略时默认为 `true`。关闭只停止代理路由，不删除 provider 配置。可通过 `/proxy default on/off` 保存默认值，在下次会话启动（包括重启或 `/reload`）时生效，不改变当前开关。
 
 ### 旧配置处理
 
@@ -49,15 +52,22 @@ npm install
 
 ```text
 /proxy
+/proxy on
+/proxy off
+/proxy default on
+/proxy default off
 /proxy status
 /proxy list
 /proxy set openai-codex http://127.0.0.1:7897
 /proxy remove openai-codex
 ```
 
-- `set` 为整个 provider 设置代理；如果当前模型属于该 provider，立即生效。
+- `/proxy` 切换当前会话的代理开关；`on` / `off` 明确开启或关闭，不修改默认值。
+- `default on` / `default off` 保存后续会话的默认开关，不改变当前状态。
+- 关闭期间，切换模型或设置代理都不会重新启用路由；开启时按当前 provider 的配置恢复代理，未配置则保持直连。
+- `set` 为整个 provider 设置代理；如果插件已开启且当前模型属于该 provider，立即生效。
 - `remove` 删除整个 provider 的代理；如果当前正在使用该 provider，立即恢复直连。
-- `status` 显示当前 provider、代理及实际路由状态，`list` 按 provider 列出配置。
+- `status` 显示当前开关、启动默认值、当前 provider、代理及实际路由状态，`list` 按 provider 列出配置。
 - 命令不再接受 `provider/modelId` 参数。
 
 ## 限制
@@ -72,7 +82,7 @@ npm install
 npm test
 ```
 
-测试使用 Node.js 内置测试运行器，不新增依赖。覆盖 provider 切换、同 provider 模型复用、配置读写、旧格式拒绝及关闭时恢复直连，不连接真实模型服务。
+测试使用 Node.js 内置测试运行器，不新增依赖。覆盖开关切换、默认值持久化、关闭期间模型切换及配置修改、provider 切换、同 provider 模型复用、配置读写失败、旧格式拒绝及关闭时恢复直连，不连接真实模型服务。
 
 ## 发布到 npm
 

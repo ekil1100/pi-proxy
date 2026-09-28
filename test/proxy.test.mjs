@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -76,6 +76,7 @@ async function setup(t, config = { providers: {} }) {
     statuses,
     emit,
     command: (args) => commands.get("proxy").handler(args, ctx),
+    complete: (prefix) => commands.get("proxy").getArgumentCompletions(prefix),
     readConfig: () => JSON.parse(readFileSync(configPath, "utf8")),
     async select(provider, id = "model-b", source = "set") {
       const previousModel = ctx.model;
@@ -84,6 +85,17 @@ async function setup(t, config = { providers: {} }) {
     },
   };
 }
+
+test("command completion lists subcommands and default switch values", async (t) => {
+  const app = await setup(t);
+  const values = (prefix) => app.complete(prefix)?.map((item) => item.value);
+  assert.deepEqual(values(""), ["on", "off", "default on", "default off", "status", "list", "set", "remove"]);
+  assert.deepEqual(values("o"), ["on", "off"]);
+  assert.deepEqual(values("default "), ["default on", "default off"]);
+  assert.deepEqual(app.complete("default of"), [{ value: "default off", label: "default off" }]);
+  assert.equal(app.complete("unknown"), null);
+  assert.equal(app.complete("default off "), null);
+});
 
 test("models from one configured provider share the same proxy dispatcher", async (t) => {
   const app = await setup(t, { providers: { "openai-codex": proxyUrl } });
@@ -246,6 +258,7 @@ test("invalid provider config shapes and entries are rejected", async (t) => {
   for (const config of [
     null,
     { providers: [] },
+    { providers: {}, defaultEnabled: "off" },
     { providers: { "openai-codex/model-a": proxyUrl } },
     { providers: { "openai-codex": 123 } },
     { providers: { "openai-codex": "" } },
@@ -276,6 +289,92 @@ test("provider IDs never resolve inherited object properties", async (t) => {
   await app.command("remove __proto__");
   assert.deepEqual(app.readConfig(), { providers: {} });
   assert.equal(getGlobalDispatcher(), app.directDispatcher);
+});
+
+test("toggle and explicit switches preserve config and gate model changes and edits", async (t) => {
+  const config = { providers: { "openai-codex": proxyUrl, anthropic: otherProxyUrl } };
+  const app = await setup(t, config);
+  await app.emit("session_start");
+  await app.command("");
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  assert.equal(app.statuses.get("proxy"), undefined);
+  assert.match(app.notifications.at(-1).message, /Proxy plugin: OFF/);
+  assert.deepEqual(app.readConfig(), config);
+
+  await app.select("anthropic");
+  await app.command(`set anthropic ${proxyUrl}`);
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.command("off");
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.command("on");
+  const dispatcher = getGlobalDispatcher();
+  assert.ok(dispatcher instanceof ProxyAgent);
+  await app.command("on");
+  assert.equal(getGlobalDispatcher(), dispatcher);
+  await app.command("");
+  await app.command("");
+  assert.ok(getGlobalDispatcher() instanceof ProxyAgent);
+});
+
+test("startup defaults persist independently from the runtime switch", async (t) => {
+  const app = await setup(t, { providers: { "openai-codex": proxyUrl } });
+  await app.emit("session_start");
+  const dispatcher = getGlobalDispatcher();
+  await app.command("default off");
+  assert.equal(app.readConfig().defaultEnabled, false);
+  assert.equal(getGlobalDispatcher(), dispatcher);
+  await app.emit("session_shutdown");
+  await app.emit("session_start");
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.command(`set openai-codex ${otherProxyUrl}`);
+  assert.equal(app.readConfig().defaultEnabled, false);
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.command("default on");
+  assert.equal(app.readConfig().defaultEnabled, true);
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.emit("session_start");
+  assert.ok(getGlobalDispatcher() instanceof ProxyAgent);
+  await app.command("remove openai-codex");
+  assert.deepEqual(app.readConfig(), { providers: {}, defaultEnabled: true });
+});
+
+test("switches work without a model and do not enable an unconfigured provider", async (t) => {
+  const app = await setup(t, { defaultEnabled: false, providers: { anthropic: proxyUrl } });
+  app.ctx.model = undefined;
+  await app.emit("session_start");
+  await app.command("");
+  assert.match(app.notifications.at(-1).message, /Proxy plugin: ON/);
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.select("unconfigured");
+  assert.equal(getGlobalDispatcher(), app.directDispatcher);
+  await app.select("anthropic");
+  assert.ok(getGlobalDispatcher() instanceof ProxyAgent);
+});
+
+test("invalid switch arguments leave configuration and routing unchanged", async (t) => {
+  const config = { providers: { "openai-codex": proxyUrl } };
+  const app = await setup(t, config);
+  await app.emit("session_start");
+  const dispatcher = getGlobalDispatcher();
+  for (const args of ["default", "default maybe", "default off extra", "off extra", "on extra"]) {
+    await app.command(args);
+    assert.equal(app.notifications.at(-1).level, "error");
+    assert.deepEqual(app.readConfig(), config);
+    assert.equal(getGlobalDispatcher(), dispatcher);
+  }
+});
+
+test("failed default writes report an error without changing runtime or in-memory default", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const app = await setup(t);
+  await app.emit("session_start");
+  rmSync(app.configPath);
+  mkdirSync(app.configPath);
+  await app.command("default off");
+  assert.equal(app.notifications.at(-1).level, "error");
+  await app.command("status");
+  assert.match(app.notifications.at(-1).message, /Startup default: ON/);
+  assert.match(app.notifications.at(-1).message, /Proxy plugin: ON/);
 });
 
 test("shutdown clears active provider state before the next session", async (t) => {
